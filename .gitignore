@@ -23,3 +23,5 @@ venv/
 
 # windows helpers (not needed on CI)
 *.bat
+# debug scripts
+_*.py
