@@ -135,6 +135,7 @@ def fetch_positions(wallet, timeout_wait=60):
             page.goto(PROFILE_URL.format(wallet=wallet), timeout=90000,
                       wait_until="domcontentloaded")
             deadline = time.time() + timeout_wait
+            started = time.time()
             body = ""
             while time.time() < deadline:
                 time.sleep(2)
@@ -142,9 +143,22 @@ def fetch_positions(wallet, timeout_wait=60):
                 if "Morpho" in body and ("Lending" in body or "Yield" in body):
                     break
             cards = page.evaluate(JS_CARDS)
+            waited = time.time() - started
+            print(f"[debank] waited {waited:.0f}s, cards={len(cards)}, "
+                  f"body_len={len(body)}")
             browser.close()
     except Exception as e:
         return None, [], f"debank scrape failed: {str(e)[:90]}"
+
+    # A loaded profile page always contains the address and the "Wallet" block.
+    # Their absence means we got a captcha / empty shell / blocked IP - that is
+    # an error, NOT "this wallet has no positions".
+    body_low = body.lower()
+    address_seen = wallet.lower() in body_low
+    page_ok = address_seen or ("wallet" in body_low and "$" in body)
+    if not page_ok:
+        head = " ".join(body.split())[:120]
+        return None, [], f"debank page did not load (blocked/captcha?): {head}"
 
     total = None
     seg = body[body.find("All Chain"): body.find("Unfold")] if "All Chain" in body else ""
@@ -155,6 +169,12 @@ def fetch_positions(wallet, timeout_wait=60):
     positions = [c for c in (_parse_card(card) for card in cards) if c]
     # drop empty wallets / dust rows
     positions = [p for p in positions if p["usd"] > 0 or p["assets"]]
+
+    # Page loaded but the protocol strip is missing while other data exists:
+    # report it, so a silent zero does not masquerade as "all closed".
+    if not positions and total and total > 1:
+        return total, [], ("debank: portfolio shows $%.2f but no protocol cards "
+                           "parsed (layout changed?)" % total)
     return total, positions, None
 
 
