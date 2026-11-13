@@ -1,0 +1,16 @@
+{
+  "dust_usd": 1.0,
+  "move_usd": 1.0,
+  "gas_limit_usd": 0.5,
+  "chart_min_spread_usd": 1.0,
+  "chart_enabled": true,
+  "quick_interval_min": 15,
+  "heartbeat_hours": 24,
+  "db_retention_days": 90,
+  "silence_hours": 2,
+  "fail_streak_limit": 3,
+  "report_schedule": ["09:00", "21:00"],
+  "digest_enabled": true,
+  "digest_threshold": 5,
+  "muted_until": null
+}

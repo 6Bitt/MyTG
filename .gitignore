@@ -1,0 +1,25 @@
+# secrets - NEVER commit
+.env
+ci.env
+*.env
+
+# runtime state
+history.db
+history.db-journal
+prices.json
+watcher.log*
+bot.log
+cron.log
+*.out
+
+# generated charts
+chart_*.png
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# windows helpers (not needed on CI)
+*.bat

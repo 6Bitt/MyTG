@@ -1,0 +1,78 @@
+name: wallet-watch
+
+on:
+  schedule:
+    # GitHub throttles cron (documented min is 5 min, real drift is 5-20 min).
+    # Fire often; run_ci.py decides quick vs full from the stored history.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "send a report even without changes"
+        type: boolean
+        default: true
+
+concurrency:
+  group: wallet-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore state (history, config, price cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            history.db
+            config.json
+            prices.json
+          key: watcher-state-${{ github.run_id }}
+          restore-keys: watcher-state-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet requests playwright matplotlib
+
+      - name: Install Chromium (DeBank needs a real browser)
+        run: playwright install --with-deps chromium
+
+      - name: Run
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          WATCHER_ENV: ${{ github.workspace }}/ci.env
+          FORCE_INPUT: ${{ inputs.force }}
+        run: |
+          printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN" > ci.env
+          FORCE_FLAG=""
+          [ "$FORCE_INPUT" = "true" ] && FORCE_FLAG="--force"
+          python run_ci.py $FORCE_FLAG
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            history.db
+            config.json
+            prices.json
+          key: watcher-state-${{ github.run_id }}
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watcher-log
+          path: |
+            watcher.log*
+            chart_*.png
+          retention-days: 7
