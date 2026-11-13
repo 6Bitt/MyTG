@@ -19,6 +19,12 @@ def main():
     con = w.db_init()
     wallets = w.load_wallets()
 
+    # CI visibility: is history actually carrying over between runs?
+    db_size = w.DB_FILE.stat().st_size if w.DB_FILE.exists() else 0
+    runs = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    last = con.execute("SELECT ts, kind FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+    print(f"[state] history.db={db_size}b runs={runs} last={last}")
+
     # Is a full (DeBank) run due for any wallet?
     due = []
     now = datetime.now(timezone.utc)
