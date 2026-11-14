@@ -24,6 +24,24 @@ JS_TOTAL = """() => {
   return body;
 }"""
 
+JS_WALLET_TOKENS = """() => {
+  // The token table renders into one flattened text run:
+  //   "Token Price Amount USD Value FXB_20261231 $0.9817 22.3384 $21.93 frxUSD $0.9997 ..."
+  const body = (document.body.innerText || '').replace(/\\s+/g, ' ');
+  const i = body.indexOf('Token Price Amount USD Value');
+  if (i < 0) return [];
+  let seg = body.slice(i + 'Token Price Amount USD Value'.length, i + 1400);
+  const stop = seg.search(/(Tokens with small balances|Show all|Accountable|Morpho|Stake DAO|Merkl)\\b/);
+  if (stop > 0) seg = seg.slice(0, stop);
+  const rows = seg.trim().split(/ (?=[A-Za-z][A-Za-z0-9_.]{1,15} \\$)/);
+  const out = [];
+  for (const r of rows) {
+    const m = r.match(/^([A-Za-z][A-Za-z0-9_.]{1,15}) \\$([\\d,.]+) ([\\d,.]+) \\$([\\d,.]+)/);
+    if (m) out.push({symbol: m[1], price: '$' + m[2], amount: m[3], usd: '$' + m[4]});
+  }
+  return out;
+}"""
+
 CHAIN_ALIASES = {
     "eth": "ethereum", "ethereum": "ethereum",
     "bsc": "bsc", "bnb": "bsc",
@@ -40,7 +58,8 @@ NOISE = {
 }
 
 MONEY = re.compile(r"^\$?([\d,]+(?:\.\d+)?)$")
-ASSET = re.compile(r"^([\d,]+(?:\.\d+)?)\s+([A-Za-z0-9._-]{2,12})$")
+# "15.0050 MUSD" but also "0.0274 CRV (<$0.01)" - trailing notes are common
+ASSET = re.compile(r"^([\d,]+(?:\.\d+)?)\s+([A-Za-z0-9._-]{2,12})(?:\s|$)")
 
 
 def _parse_card(card):
@@ -86,9 +105,26 @@ def _parse_card(card):
         pool = ln
         break
 
-    for ln in rest:
-        m = ASSET.match(ln)
-        if m:
+    rewards = []
+    # In DeBank's DOM the "Claim" button and the "Rewards" header can appear
+# either side of the amount, so ordering is unreliable. Treat a token as a
+# reward when Claim/Rewards appears within two lines of it.
+    reward_zone = set()
+    for j, ln in enumerate(rest):
+        if ln.lower() in ("claim", "rewards", "claimable"):
+            for k in range(max(0, j - 2), min(len(rest), j + 3)):
+                reward_zone.add(k)
+
+    for idx, ln in enumerate(rest):
+        if not ASSET.match(ln):
+            continue
+        # "Claim" also sits next to the pool's own $ value, so never treat a
+        # bare dollar figure as a reward.
+        if "USD Value" in (rest[idx - 1] if idx else ""):
+            continue
+        if idx in reward_zone:
+            rewards.append(ln)
+        else:
             assets.append(ln)
 
     # the pool's own USD value is the largest $ figure after the header block
@@ -117,6 +153,7 @@ def _parse_card(card):
         "pool": pool,
         "usd": round(usd or 0.0, 2),
         "assets": assets[:6],
+        "rewards": rewards[:4],
         "health": health,
     }
 
@@ -143,9 +180,10 @@ def fetch_positions(wallet, timeout_wait=60):
                 if "Morpho" in body and ("Lending" in body or "Yield" in body):
                     break
             cards = page.evaluate(JS_CARDS)
+            wallet_tokens = page.evaluate(JS_WALLET_TOKENS)
             waited = time.time() - started
             print(f"[debank] waited {waited:.0f}s, cards={len(cards)}, "
-                  f"body_len={len(body)}")
+                  f"tokens={len(wallet_tokens)}, body_len={len(body)}")
             browser.close()
     except Exception as e:
         return None, [], f"debank scrape failed: {str(e)[:90]}"
@@ -175,7 +213,26 @@ def fetch_positions(wallet, timeout_wait=60):
     if not positions and total and total > 1:
         return total, [], ("debank: portfolio shows $%.2f but no protocol cards "
                            "parsed (layout changed?)" % total)
+
+    # 24h change: DeBank prints "$199 -0.13%" in the header
+    change_24h = None
+    m = re.search(r"\$[\d,]+(?:\.\d+)?\s+([+-]\d+(?:\.\d+)?)%", body)
+    if m:
+        change_24h = float(m.group(1))
+
+    # parsed wallet tokens ride along on the first position slot via a
+    # dedicated key so callers keep the (total, positions, error) contract
+    globals()["_last_wallet_tokens"] = wallet_tokens
+    globals()["_last_change_24h"] = change_24h
     return total, positions, None
+
+
+def last_wallet_tokens():
+    return globals().get("_last_wallet_tokens") or []
+
+
+def last_change_24h():
+    return globals().get("_last_change_24h")
 
 
 def summarize_by_protocol(positions):

@@ -25,3 +25,11 @@ venv/
 *.bat
 # debug scripts
 _*.py
+
+# tokens - NEVER commit
+.tok.tmp
+*.tok
+
+# runtime artifacts
+shutdown.log
+*.lock

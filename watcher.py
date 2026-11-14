@@ -14,13 +14,15 @@ Alert types (DeFi-focused):
 import argparse
 import json
 import os
+import re
 import sqlite3
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from debank import fetch_positions, summarize_by_protocol
+from debank import (fetch_positions, last_wallet_tokens, last_change_24h,
+                    summarize_by_protocol)
 
 ROOT = Path(__file__).parent
 DB_FILE = ROOT / "history.db"
@@ -195,14 +197,16 @@ def db_init():
             ts TEXT NOT NULL, kind TEXT NOT NULL,
             portfolio_total REAL, notes TEXT,
             ok INTEGER DEFAULT 1,
-            wallet TEXT
+            wallet TEXT,
+            wallet_tokens TEXT,
+            change_24h REAL
         );
         CREATE TABLE IF NOT EXISTS balances (
             run_id INTEGER, chain TEXT, balance REAL, nonce INTEGER, symbol TEXT
         );
         CREATE TABLE IF NOT EXISTS positions (
             run_id INTEGER, protocol TEXT, ptype TEXT, chain TEXT,
-            pool TEXT, usd REAL, assets TEXT, health REAL
+            pool TEXT, usd REAL, assets TEXT, health REAL, rewards TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_runs_ts ON runs(ts);
     """)
@@ -213,6 +217,13 @@ def db_init():
     if "wallet" not in cols:
         con.execute("ALTER TABLE runs ADD COLUMN wallet TEXT")
         con.execute("UPDATE runs SET wallet=?", (WALLET,))
+    if "wallet_tokens" not in cols:
+        con.execute("ALTER TABLE runs ADD COLUMN wallet_tokens TEXT")
+    if "change_24h" not in cols:
+        con.execute("ALTER TABLE runs ADD COLUMN change_24h REAL")
+    pcols = {r[1] for r in con.execute("PRAGMA table_info(positions)")}
+    if "rewards" not in pcols:
+        con.execute("ALTER TABLE positions ADD COLUMN rewards TEXT")
     con.commit()
     return con
 
@@ -226,7 +237,7 @@ def db_last(con, need_positions=False, wallet=None):
     if need_positions:
         where.append("ok=1")
         where.append("id IN (SELECT run_id FROM positions)")
-    sql = "SELECT id, portfolio_total, ts FROM runs"
+    sql = "SELECT id, portfolio_total, ts, wallet_tokens, change_24h FROM runs"
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY id DESC LIMIT 1"
@@ -241,13 +252,19 @@ def db_last(con, need_positions=False, wallet=None):
     }
     positions = [
         {"protocol": p, "type": t, "chain": ch, "pool": pool,
-         "usd": u, "assets": a.split("|") if a else [], "health": h}
-        for p, t, ch, pool, u, a, h in con.execute(
-            "SELECT protocol, ptype, chain, pool, usd, assets, health FROM positions WHERE run_id=?",
-            (run_id,))
+         "usd": u, "assets": a.split("|") if a else [],
+         "rewards": rw.split("|") if rw else [], "health": h}
+        for p, t, ch, pool, u, a, rw, h in con.execute(
+            "SELECT protocol, ptype, chain, pool, usd, assets, rewards, health "
+            "FROM positions WHERE run_id=?", (run_id,))
     ]
+    try:
+        tokens = json.loads(row[3]) if row[3] else []
+    except (json.JSONDecodeError, TypeError):
+        tokens = []
     return {"run_id": run_id, "portfolio_total": row[1], "ts": row[2],
-            "balances": balances, "positions": positions}
+            "balances": balances, "positions": positions,
+            "wallet_tokens": tokens, "change_24h": row[4]}
 
 
 def db_known_protocols(con):
@@ -325,10 +342,13 @@ def heartbeat_due(con):
 
 def db_save(con, snap, notes):
     cur = con.execute(
-        "INSERT INTO runs(ts, kind, portfolio_total, notes, ok, wallet) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO runs(ts, kind, portfolio_total, notes, ok, wallet, "
+        "wallet_tokens, change_24h) VALUES (?,?,?,?,?,?,?,?)",
         (snap["ts"], snap["kind"], snap.get("portfolio_total"),
          "; ".join(notes)[:2000] or None, 0 if snap.get("debank_error") else 1,
-         snap.get("wallet")))
+         snap.get("wallet"),
+         json.dumps(snap.get("wallet_tokens") or [], ensure_ascii=False),
+         snap.get("change_24h")))
     rid = cur.lastrowid
     # Balances always come from RPC, so they are valid even when DeBank fails.
     for c, v in snap["balances"].items():
@@ -338,9 +358,10 @@ def db_save(con, snap, notes):
     # "everything closed" now, then "everything new" once the feed recovers.
     if not snap.get("debank_error"):
         for p in snap.get("positions", []):
-            con.execute("INSERT INTO positions VALUES (?,?,?,?,?,?,?,?)",
+            con.execute("INSERT INTO positions VALUES (?,?,?,?,?,?,?,?,?)",
                         (rid, p["protocol"], p.get("type"), p.get("chain"), p.get("pool"),
-                         p.get("usd"), "|".join(p.get("assets") or []), p.get("health")))
+                         p.get("usd"), "|".join(p.get("assets") or []), p.get("health"),
+                         "|".join(p.get("rewards") or [])))
     con.commit()
 
 
@@ -395,6 +416,56 @@ def fetch_prices():
     except Exception:
         pass
     return out
+
+
+def esc(s):
+    """Escape for Telegram HTML. Tokens like '<$0.01' otherwise break parsing."""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+ASSET_RE = re.compile(r"^([\d,]+(?:\.\d+)?)\s+([A-Za-z0-9._-]{2,12})")
+
+
+def _parse_assets(items):
+    """['15.0050 MUSD', '0.7491 USDC'] -> {'MUSD': 15.005, 'USDC': 0.7491}"""
+    out = {}
+    for it in (items or []):
+        m = ASSET_RE.match(str(it))
+        if not m:
+            continue
+        try:
+            out[m.group(2)] = out.get(m.group(2), 0.0) + float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return out
+
+
+def _asset_delta(prev_assets, cur_assets, min_change=0.005):
+    """3. Which token inside the pool moved: 'MUSD +0.03', 'USDT -0.05'."""
+    a, b = _parse_assets(prev_assets), _parse_assets(cur_assets)
+    out = []
+    for sym in sorted(set(a) | set(b)):
+        d = b.get(sym, 0.0) - a.get(sym, 0.0)
+        if abs(d) >= min_change:
+            out.append(f"{sym} {d:+.4g}")
+    return out
+
+
+def compute_pnl(con, wallet, current_total, days=7):
+    """4. Portfolio change over the last N days from stored history."""
+    if current_total is None:
+        return None
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    row = con.execute(
+        "SELECT portfolio_total FROM runs WHERE wallet=? AND ts >= ? "
+        "AND portfolio_total IS NOT NULL ORDER BY ts LIMIT 1",
+        (wallet, since)).fetchone()
+    if not row or not row[0]:
+        return None
+    start = row[0]
+    delta = current_total - start
+    pct = (delta / start * 100) if start else 0.0
+    return (days, start, delta, pct)
 
 
 def plural_ru(n, one, few, many):
@@ -473,9 +544,15 @@ def diff_defi(prev, cur, known_protocols=None, prices=None):
         a, b = prev_map[key]["usd"], cur_map[key]["usd"]
         if abs(b - a) >= cfg("move_usd"):
             icon = "📈" if b > a else "📉"
-            notes.append(f"{icon} <b>{cur_map[key]['protocol']}</b> "
-                         f"({cur_map[key].get('chain') or '?'}) "
-                         f"${a:,.2f} → ${b:,.2f} ({b - a:+,.2f})")
+            line = (f"{icon} <b>{cur_map[key]['protocol']}</b> "
+                    f"({cur_map[key].get('chain') or '?'}) "
+                    f"${a:,.2f} → ${b:,.2f} ({b - a:+,.2f})")
+            # 3. show which asset inside the pool actually moved
+            asset_delta = _asset_delta(prev_map[key].get("assets"),
+                                       cur_map[key].get("assets"))
+            if asset_delta:
+                line += "\n     " + ", ".join(asset_delta)
+            notes.append(line)
 
     pt, ct = prev.get("portfolio_total"), cur.get("portfolio_total")
     if pt is not None and ct is not None and abs(pt - ct) >= 1.0:
@@ -509,7 +586,20 @@ def render(snap, notes):
                  f"<i>{snap['ts'].replace('T', ' ')} · {snap['kind']}</i>")
 
     if total is not None:
-        parts.append(f"💼 <b>Итого: ${total:,.2f}</b>")
+        ch = snap.get("change_24h")
+        suffix = ""
+        if ch is not None:
+            arrow = "📈" if ch >= 0 else "📉"
+            suffix = f"  {arrow} {ch:+.2f}% за 24ч"
+        parts.append(f"💼 <b>Итого: ${total:,.2f}</b>{suffix}")
+
+    # 4. PnL over the stored history
+    pnl = snap.get("pnl")
+    if pnl:
+        days, start, delta, pct = pnl
+        arrow = "📈" if delta >= 0 else "📉"
+        parts.append(f"{arrow} <b>За {days} дн.:</b> ${start:,.2f} → "
+                     f"${total:,.2f} ({delta:+,.2f}, {pct:+.1f}%)")
 
     # --- changes ------------------------------------------------
     if notes:
@@ -527,16 +617,16 @@ def render(snap, notes):
             ti = TYPE_ICON.get(p.get("type") or "", "▫️")
             usd = f"${p['usd']:,.2f}"
 
-            line = f"{ti} <b>{p['protocol']}</b> — <b>{usd}</b>\n"
+            line = f"{ti} <b>{esc(p['protocol'])}</b> — <b>{usd}</b>\n"
             line += f"{ci} {chain}"
             if p.get("type"):
                 line += f" · {p['type']}"
             if p.get("health"):
                 line += f" · HF <b>{p['health']:.2f}</b>"
             if p.get("pool"):
-                line += f"\n└ <i>{p['pool']}</i>"
+                line += f"\n└ <i>{esc(p['pool'])}</i>"
             if p.get("assets"):
-                line += f"\n└ <code>{', '.join(p['assets'][:3])}</code>"
+                line += f"\n└ <code>{esc(', '.join(p['assets'][:3]))}</code>"
             blocks.append(line)
         parts.append("\n\n".join(blocks))
 
@@ -551,6 +641,35 @@ def render(snap, notes):
         wallet_lines.append(f"{ci} {chain:<9} {c['balance']:.6f} {c['symbol']}")
     if wallet_lines:
         parts.append(f"👛 <b>КОШЕЛЁК</b>\n{SEP}\n<pre>" + "\n".join(wallet_lines) + "</pre>")
+
+    # 1. tokens sitting in the wallet itself (FXB, frxUSD, CRV...)
+    tokens = snap.get("wallet_tokens") or []
+    if tokens:
+        rows = []
+        for t in tokens:
+            if not isinstance(t, dict):
+                continue
+            usd = t.get("usd", "")
+            try:
+                if float(str(usd).lstrip("$").replace(",", "")) < 0.01:
+                    continue
+            except (ValueError, AttributeError):
+                pass
+            rows.append(f"{t.get('symbol','?'):<12} {t.get('amount',''):>12} {usd:>9}")
+        if rows:
+            parts.append(f"🪙 <b>ТОКЕНЫ В КОШЕЛЬКЕ</b>\n{SEP}\n<pre>"
+                         + "\n".join(rows) + "</pre>")
+
+    # 2. unclaimed rewards across positions
+    reward_rows = []
+    for p in positions:
+        for r in (p.get("rewards") or []):
+            # "<$0.01" would open a fake HTML tag and Telegram rejects the
+            # whole message, so escape every user-derived string.
+            safe = esc(r)
+            reward_rows.append(f"{esc(p['protocol'])}: {safe}")
+    if reward_rows:
+        parts.append("🎁 <b>К ПОЛУЧЕНИЮ</b>\n" + "\n".join(reward_rows[:6]))
 
     if snap.get("debank_error"):
         parts.append(f"⚠️ <i>DeBank: {snap['debank_error'][:60]}</i>")
@@ -660,12 +779,15 @@ def check_wallet(con, wallet, label, kind, force, prices, token):
         total, positions, err = fetch_positions(wallet)
         snap["portfolio_total"] = total
         snap["positions"] = positions
+        snap["wallet_tokens"] = last_wallet_tokens()
+        snap["change_24h"] = last_change_24h()
         if err:
             snap["debank_error"] = err
     else:
         snap["portfolio_total"] = prev.get("portfolio_total") if prev else None
         snap["positions"] = prev.get("positions") if prev else []
 
+    snap["pnl"] = compute_pnl(con, wallet, snap.get("portfolio_total"))
     notes = diff_defi(prev, snap, db_known_protocols(con), prices)
     if snap.get("gap_hours"):
         notes.insert(0, f"⏸ <b>Пропуск {snap['gap_hours']} ч</b> — "
