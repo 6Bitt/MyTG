@@ -630,35 +630,43 @@ def render(snap, notes):
             blocks.append(line)
         parts.append("\n\n".join(blocks))
 
-    # --- wallet balances ----------------------------------------
-    wallet_lines = []
-    for chain, c in snap["balances"].items():
-        if c.get("balance") is None:
-            continue
-        if c["balance"] <= 0 and not (c.get("nonce") or 0) > 0:
-            continue
-        ci = CHAIN_ICON.get(chain, "•")
-        wallet_lines.append(f"{ci} {chain:<9} {c['balance']:.6f} {c['symbol']}")
-    if wallet_lines:
-        parts.append(f"👛 <b>КОШЕЛЁК</b>\n{SEP}\n<pre>" + "\n".join(wallet_lines) + "</pre>")
+    # --- wallet contents ----------------------------------------
+    # One block, not two: DeBank already lists the native coins that the RPC
+    # snapshot shows, so a separate "native balances" section just duplicated
+    # them without USD prices. Fall back to RPC only when DeBank has no tokens.
+    tokens = [t for t in (snap.get("wallet_tokens") or []) if isinstance(t, dict)]
 
-    # 1. tokens sitting in the wallet itself (FXB, frxUSD, CRV...)
-    tokens = snap.get("wallet_tokens") or []
+    def token_usd(t):
+        try:
+            return float(str(t.get("usd", "")).lstrip("$").replace(",", ""))
+        except (ValueError, AttributeError):
+            return 0.0
+
+    tokens = [t for t in tokens if token_usd(t) >= 0.01]
+
     if tokens:
         rows = []
-        for t in tokens:
-            if not isinstance(t, dict):
+        total_wallet = 0.0
+        for t in sorted(tokens, key=lambda x: -token_usd(x)):
+            usd = token_usd(t)
+            total_wallet += usd
+            rows.append(f"{t.get('symbol', '?'):<14} {t.get('amount', ''):>12} "
+                        f"{t.get('usd', ''):>9}")
+        parts.append(f"👛 <b>КОШЕЛЁК — ${total_wallet:,.2f}</b>\n{SEP}\n<pre>"
+                     + "\n".join(rows) + "</pre>")
+    else:
+        # DeBank unavailable: show what the RPC nodes returned, no prices.
+        wallet_lines = []
+        for chain, c in snap["balances"].items():
+            if c.get("balance") is None:
                 continue
-            usd = t.get("usd", "")
-            try:
-                if float(str(usd).lstrip("$").replace(",", "")) < 0.01:
-                    continue
-            except (ValueError, AttributeError):
-                pass
-            rows.append(f"{t.get('symbol','?'):<12} {t.get('amount',''):>12} {usd:>9}")
-        if rows:
-            parts.append(f"🪙 <b>ТОКЕНЫ В КОШЕЛЬКЕ</b>\n{SEP}\n<pre>"
-                         + "\n".join(rows) + "</pre>")
+            if c["balance"] <= 0 and not (c.get("nonce") or 0) > 0:
+                continue
+            ci = CHAIN_ICON.get(chain, "•")
+            wallet_lines.append(f"{ci} {chain:<9} {c['balance']:.6f} {c['symbol']}")
+        if wallet_lines:
+            parts.append(f"👛 <b>КОШЕЛЁК</b> <i>(без цен)</i>\n{SEP}\n<pre>"
+                         + "\n".join(wallet_lines) + "</pre>")
 
     # 2. unclaimed rewards across positions
     reward_rows = []
